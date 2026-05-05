@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-#Telegram News Bot - Fetch từ channel nguồn, rewrite bằng Groq AI, đăng lên channel đích
+
+# -*- coding: utf-8 -*-
+
+# Telegram News Bot
+
+# Fetch tu channel nguon -> rewrite bang Groq AI -> dang len channel dich
 
 import os
+import re
 import json
 import time
-import asyncio
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from groq import Groq
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# — Logging —
 
 logging.basicConfig(
 level=logging.INFO,
@@ -21,103 +25,71 @@ datefmt=”%Y-%m-%d %H:%M:%S”,
 )
 log = logging.getLogger(**name**)
 
-# ─── Config từ biến môi trường ───────────────────────────────────────────────
+# — Config tu bien moi truong —
 
-TELEGRAM_BOT_TOKEN   = os.environ[“TELEGRAM_BOT_TOKEN”]       # Bot token từ @BotFather
-TELEGRAM_TARGET_CHAT = os.environ[“TELEGRAM_TARGET_CHAT”]     # @channel_username hoặc -100xxx
-SOURCE_CHANNELS      = os.environ.get(“SOURCE_CHANNELS”, “”).split(”,”)  # vd: @guguwatcher,@otherchan
+TELEGRAM_BOT_TOKEN   = os.environ[“TELEGRAM_BOT_TOKEN”]
+TELEGRAM_TARGET_CHAT = os.environ[“TELEGRAM_TARGET_CHAT”]
+SOURCE_CHANNELS      = os.environ.get(“SOURCE_CHANNELS”, “”).split(”,”)
 GROQ_API_KEY         = os.environ[“GROQ_API_KEY”]
 GROQ_MODEL           = os.environ.get(“GROQ_MODEL”, “llama-3.3-70b-versatile”)
 
-# File lưu ID tin nhắn đã xử lý (dùng trong GitHub Actions qua artifact/cache)
+STATE_FILE   = Path(“data/processed_ids.json”)
+TELEGRAM_API = “https://api.telegram.org/bot” + TELEGRAM_BOT_TOKEN
 
-STATE_FILE = Path(“data/processed_ids.json”)
-
-TELEGRAM_API = f”https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}”
-
-# ─── Groq client ─────────────────────────────────────────────────────────────
+# — Groq client —
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = “”“Bạn là một biên tập viên tin tức chuyên nghiệp người Việt.
-Nhiệm vụ: Viết lại tin tức được cung cấp theo phong cách rõ ràng, hấp dẫn và dễ đọc bằng tiếng Việt.
+SYSTEM_PROMPT = (
+“Ban la mot bien tap vien tin tuc chuyen nghiep nguoi Viet.\n”
+“Nhiem vu: Viet lai tin tuc duoc cung cap theo phong cach ro rang, hap dan va de doc bang tieng Viet.\n\n”
+“Quy tac:\n”
+“- Giu nguyen thong tin quan trong (so lieu, ten, thoi gian)\n”
+“- Viet lai tu nhien, khong dich may\n”
+“- Them emoji phu hop o dau moi doan neu can\n”
+“- Do dai: ngan gon, toi da 300 tu\n”
+“- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n”
+“- Khong them loi dan nhu ‘Duoi day la…’ hay ‘Tin tuc:’\n”
+“- Tra ve truc tiep noi dung da viet lai”
+)
 
-Quy tắc:
-
-- Giữ nguyên thông tin quan trọng (số liệu, tên, thời gian)
-- Viết lại tự nhiên, không dịch máy
-- Thêm emoji phù hợp ở đầu mỗi đoạn nếu cần
-- Độ dài: ngắn gọn, tối đa 300 từ
-- Kết thúc bằng hashtag liên quan (tối đa 5 hashtag)
-- Không thêm lời dẫn như “Dưới đây là…” hay “Tin tức:”
-- Trả về trực tiếp nội dung đã viết lại”””
-
-def load_state() -> dict:
-“”“Tải danh sách ID đã xử lý.”””
+def load_state():
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 if STATE_FILE.exists():
 try:
-return json.loads(STATE_FILE.read_text())
+return json.loads(STATE_FILE.read_text(encoding=“utf-8”))
 except Exception:
 pass
 return {}
 
-def save_state(state: dict) -> None:
-“”“Lưu danh sách ID đã xử lý.”””
+def save_state(state):
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+STATE_FILE.write_text(
+json.dumps(state, indent=2, ensure_ascii=False),
+encoding=“utf-8”
+)
 
-def telegram_get(method: str, params: dict = None) -> dict:
-“”“Gọi Telegram Bot API (GET).”””
-url = f”{TELEGRAM_API}/{method}”
+def telegram_get(method, params=None):
+url  = TELEGRAM_API + “/” + method
 resp = httpx.get(url, params=params or {}, timeout=30)
 resp.raise_for_status()
 data = resp.json()
 if not data.get(“ok”):
-raise RuntimeError(f”Telegram API error: {data}”)
+raise RuntimeError(“Telegram API error: “ + str(data))
 return data[“result”]
 
-def telegram_post(method: str, payload: dict) -> dict:
-“”“Gọi Telegram Bot API (POST).”””
-url = f”{TELEGRAM_API}/{method}”
+def telegram_post(method, payload):
+url  = TELEGRAM_API + “/” + method
 resp = httpx.post(url, json=payload, timeout=30)
 resp.raise_for_status()
 data = resp.json()
 if not data.get(“ok”):
-log.warning(f”Telegram API warning: {data}”)
+log.warning(“Telegram API warning: %s”, data)
 return {}
 return data.get(“result”, {})
 
-def fetch_channel_updates(channel: str, offset: int = 0, limit: int = 20) -> list[dict]:
-“””
-Lấy tin nhắn từ channel/group mà bot đã được thêm vào.
-Dùng getUpdates nếu channel là private, hoặc getChat + forwardedMessages.
-
-```
-Lưu ý: Bot phải là THÀNH VIÊN của channel nguồn để đọc được.
-Phương pháp đơn giản nhất: bot forward tin về private chat, hoặc
-dùng userbot (Telethon) - xem README để biết thêm.
-
-Ở đây dùng getUpdates để lấy tin nhắn forwarded/posted đến bot.
-"""
-try:
-    updates = telegram_get("getUpdates", {
-        "offset": offset,
-        "limit": limit,
-        "timeout": 0,
-        "allowed_updates": json.dumps(["channel_post", "message"])
-    })
-    return updates if isinstance(updates, list) else []
-except Exception as e:
-    log.error(f"Lỗi fetch updates: {e}")
-    return []
-```
-
-def fetch_via_json_endpoint(channel: str, last_id: int = 0) -> list[dict]:
-“””
-Fetch tin từ public channel qua endpoint t.me/s/<channel> (scraping).
-Hoạt động với public channel không cần userbot.
-“””
+def fetch_channel_messages(channel, last_id=0):
+“”“Scrape tin moi tu public Telegram channel qua t.me/s/<channel>.”””
 channel_name = channel.lstrip(”@”)
 messages = []
 
@@ -125,169 +97,162 @@ messages = []
 try:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)",
-        "Accept": "application/json",
+        "Accept": "text/html,application/xhtml+xml",
     }
-    url = f"https://t.me/s/{channel_name}"
+    url  = "https://t.me/s/" + channel_name
     resp = httpx.get(url, headers=headers, timeout=20, follow_redirects=True)
-    
+
     if resp.status_code != 200:
-        log.warning(f"Không thể fetch {channel}: HTTP {resp.status_code}")
+        log.warning("Khong the fetch %s: HTTP %s", channel, resp.status_code)
         return []
-    
-    # Parse HTML để lấy tin nhắn (basic scraping)
-    import re
-    
-    # Lấy message IDs và text từ HTML
-    msg_pattern = re.compile(
-        r'data-post=["\']' + re.escape(channel_name) + r'/(\d+)["\'].*?'
-        r'<div class=["\']tgme_widget_message_text[^"\']*["\'][^>]*>(.*?)</div>',
-        re.DOTALL
+
+    html = resp.text
+
+    id_pattern = re.compile(
+        r'data-post=["\']' + re.escape(channel_name) + r'/(\d+)["\']',
+        re.IGNORECASE
     )
-    
-    for match in msg_pattern.finditer(resp.text):
-        msg_id = int(match.group(1))
+    txt_pattern = re.compile(
+        r'class=["\']tgme_widget_message_text[^"\']*["\'][^>]*>(.*?)</div>',
+        re.DOTALL | re.IGNORECASE
+    )
+
+    ids   = id_pattern.findall(html)
+    texts = txt_pattern.findall(html)
+
+    for msg_id_str, raw_html in zip(ids, texts):
+        msg_id = int(msg_id_str)
         if msg_id <= last_id:
             continue
-        
-        # Clean HTML tags
-        raw_html = match.group(2)
+
         text = re.sub(r'<br\s*/?>', '\n', raw_html)
-        text = re.sub(r'<[^>]+>', '', text)
-        text = text.strip()
-        
-        if text and len(text) > 20:  # Bỏ qua tin quá ngắn
+        text = re.sub(r'<[^>]+>', '', text).strip()
+
+        if text and len(text) > 20:
             messages.append({
-                "id": msg_id,
-                "text": text,
+                "id":      msg_id,
+                "text":    text,
                 "channel": channel,
-                "url": f"https://t.me/{channel_name}/{msg_id}"
+                "url":     "https://t.me/" + channel_name + "/" + msg_id_str,
             })
-    
-    log.info(f"Fetch {channel}: {len(messages)} tin mới")
-    
-except Exception as e:
-    log.error(f"Lỗi fetch {channel}: {e}")
+
+    log.info("Fetch %s: %d tin moi", channel, len(messages))
+
+except Exception as exc:
+    log.error("Loi fetch %s: %s", channel, exc)
 
 return sorted(messages, key=lambda x: x["id"])
 ```
 
-def rewrite_with_groq(text: str, source_url: str = “”) -> str:
-“”“Viết lại nội dung tin tức bằng Groq AI.”””
+def rewrite_with_groq(text, source_url=””):
+“”“Viet lai noi dung bang Groq AI.”””
 try:
-prompt = f”Viết lại tin tức sau:\n\n{text}”
+prompt = “Viet lai tin tuc sau:\n\n” + text
 if source_url:
-prompt += f”\n\nNguồn: {source_url}”
+prompt += “\n\nNguon: “ + source_url
 
 ```
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt}
+            {"role": "user",   "content": prompt},
         ],
         temperature=0.7,
         max_tokens=600,
     )
     result = response.choices[0].message.content.strip()
-    log.info(f"Groq rewrite thành công ({len(result)} ký tự)")
+    log.info("Groq rewrite thanh cong (%d ky tu)", len(result))
     return result
-    
-except Exception as e:
-    log.error(f"Lỗi Groq API: {e}")
+
+except Exception as exc:
+    log.error("Loi Groq API: %s", exc)
     return ""
 ```
 
-def post_to_telegram(text: str, source_url: str = “”) -> bool:
-“”“Đăng tin lên Telegram channel đích.”””
-try:
-# Thêm attribution nếu có URL nguồn
-footer = f”\n\n🔗 [Xem nguồn]({source_url})” if source_url else “”
+def post_to_telegram(text, source_url=””):
+“”“Dang tin len Telegram channel dich.”””
+footer  = (”\n\n[Xem nguon](” + source_url + “)”) if source_url else “”
 message = text + footer
 
 ```
-    # Giới hạn 4096 ký tự của Telegram
-    if len(message) > 4096:
-        message = message[:4090] + "..."
-    
-    payload = {
-        "chat_id": TELEGRAM_TARGET_CHAT,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-    }
-    
+if len(message) > 4096:
+    message = message[:4090] + "..."
+
+payload = {
+    "chat_id":                  TELEGRAM_TARGET_CHAT,
+    "text":                     message,
+    "parse_mode":               "Markdown",
+    "disable_web_page_preview": False,
+}
+
+try:
     result = telegram_post("sendMessage", payload)
     if result:
-        log.info(f"✅ Đã đăng tin (msg_id: {result.get('message_id')})")
+        log.info("Da dang tin (msg_id: %s)", result.get("message_id"))
         return True
     return False
-    
-except Exception as e:
-    log.error(f"Lỗi đăng Telegram: {e}")
-    # Thử lại không có Markdown nếu lỗi parse
+
+except Exception as exc:
+    log.error("Loi dang Telegram (Markdown): %s", exc)
     try:
-        payload["parse_mode"] = "HTML"
-        payload["text"] = text.replace("*", "").replace("_", "")
+        payload["parse_mode"] = None
+        payload["text"]       = text
         result = telegram_post("sendMessage", payload)
         return bool(result)
-    except Exception:
+    except Exception as exc2:
+        log.error("Loi dang Telegram (plain): %s", exc2)
         return False
 ```
 
-def run_bot() -> None:
-“”“Vòng lặp chính của bot.”””
-log.info(“🤖 Bot khởi động”)
-log.info(f”📡 Channels nguồn: {SOURCE_CHANNELS}”)
-log.info(f”📢 Channel đích: {TELEGRAM_TARGET_CHAT}”)
-log.info(f”🧠 Groq model: {GROQ_MODEL}”)
+def run_bot():
+log.info(“Bot khoi dong”)
+log.info(“Channels nguon: %s”, SOURCE_CHANNELS)
+log.info(“Channel dich  : %s”, TELEGRAM_TARGET_CHAT)
+log.info(“Groq model    : %s”, GROQ_MODEL)
 
 ```
-state = load_state()
+state        = load_state()
 posted_count = 0
 
 for channel in SOURCE_CHANNELS:
     channel = channel.strip()
     if not channel:
         continue
-    
-    log.info(f"\n--- Xử lý channel: {channel} ---")
-    
-    last_id = state.get(channel, 0)
-    messages = fetch_via_json_endpoint(channel, last_id)
-    
+
+    log.info("--- Xu ly channel: %s ---", channel)
+    last_id  = state.get(channel, 0)
+    messages = fetch_channel_messages(channel, last_id)
+
     if not messages:
-        log.info(f"Không có tin mới từ {channel}")
+        log.info("Khong co tin moi tu %s", channel)
         continue
-    
-    log.info(f"Tìm thấy {len(messages)} tin mới từ {channel}")
-    
+
+    log.info("Tim thay %d tin moi tu %s", len(messages), channel)
+
     for msg in messages:
         msg_id  = msg["id"]
         text    = msg["text"]
         src_url = msg.get("url", "")
-        
-        log.info(f"Xử lý tin #{msg_id}: {text[:60]}...")
-        
-        # Rewrite bằng Groq
+
+        log.info("Xu ly tin #%d: %s...", msg_id, text[:60])
+
         rewritten = rewrite_with_groq(text, src_url)
         if not rewritten:
-            log.warning(f"Bỏ qua tin #{msg_id} (Groq thất bại)")
+            log.warning("Bo qua tin #%d (Groq that bai)", msg_id)
             continue
-        
-        # Đăng lên Telegram
+
         success = post_to_telegram(rewritten, src_url)
-        
+
         if success:
             state[channel] = max(state.get(channel, 0), msg_id)
-            posted_count += 1
+            posted_count  += 1
             save_state(state)
-            
-            # Delay tránh spam / rate limit
             time.sleep(3)
         else:
-            log.warning(f"Không đăng được tin #{msg_id}")
+            log.warning("Khong dang duoc tin #%d", msg_id)
 
-log.info(f"\n✅ Hoàn thành! Đã đăng {posted_count} tin.")
+log.info("Hoan thanh! Da dang %d tin.", posted_count)
 save_state(state)
 ```
 
