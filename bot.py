@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-#“””
 #Telegram News Bot - Fetch từ channel nguồn, rewrite bằng Groq AI, đăng lên channel đích
-#“””
 
 import os
 import json
