@@ -1,0 +1,70 @@
+name: 🤖 Telegram News Bot
+
+on:
+  schedule:
+    # Chạy mỗi 30 phút
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    # Cho phép chạy thủ công từ GitHub UI
+    inputs:
+      debug:
+        description: "Bật debug log"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write  # Cần để commit state file
+
+jobs:
+  run-bot:
+    name: Fetch & Repost News
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────────
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── 2. Restore state (processed IDs) từ cache ─────────────────────────
+      - name: 💾 Restore processed IDs cache
+        uses: actions/cache@v4
+        with:
+          path: data/processed_ids.json
+          key: processed-ids-${{ github.run_id }}
+          restore-keys: |
+            processed-ids-
+
+      # ── 3. Setup Python ───────────────────────────────────────────────────
+      - name: 🐍 Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # ── 4. Install dependencies ───────────────────────────────────────────
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Run bot ────────────────────────────────────────────────────────
+      - name: 🚀 Run bot
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+          SOURCE_CHANNELS:      ${{ secrets.SOURCE_CHANNELS }}
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL:           ${{ vars.GROQ_MODEL || 'llama-3.3-70b-versatile' }}
+        run: |
+          python bot.py
+
+      # ── 6. Commit state nếu có thay đổi ──────────────────────────────────
+      - name: 💾 Commit updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data
+          git add data/processed_ids.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "chore: update processed IDs [skip ci]"
+          git push || echo "Không có thay đổi cần push"
