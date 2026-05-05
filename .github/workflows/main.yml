@@ -2,8 +2,8 @@ name: 🤖 Telegram News Bot
 
 on:
   schedule:
-    # Chạy mỗi 30 phút
-    - cron: "*/30 * * * *"
+    # Chạy mỗi 0 phút 4 tiếng
+    - cron: "0 */4 * * *"
   workflow_dispatch:
     # Cho phép chạy thủ công từ GitHub UI
     inputs:
