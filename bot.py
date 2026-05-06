@@ -17,7 +17,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_TARGET_CHAT = os.environ["TELEGRAM_TARGET_CHAT"]
+TELEGRAM_TARGET_CHATS    = [c.strip() for c in os.environ["TELEGRAM_TARGET_CHAT"].split(",") if c.strip()]
+TELEGRAM_TARGET_CHATS_EN = [c.strip() for c in os.environ.get("TELEGRAM_TARGET_CHAT_EN", "").split(",") if c.strip()]
 SOURCE_CHANNELS      = os.environ.get("SOURCE_CHANNELS", "").split(",")
 GROQ_API_KEY         = os.environ["GROQ_API_KEY"]
 GROQ_MODEL           = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -27,7 +28,7 @@ TELEGRAM_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_VI = (
     "Ban la mot bien tap vien tin tuc chuyen nghiep nguoi Viet.\n"
     "Nhiem vu: Viet lai tin tuc theo phong cach ro rang, hap dan bang tieng Viet.\n\n"
     "Quy tac:\n"
@@ -38,6 +39,19 @@ SYSTEM_PROMPT = (
     "- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n"
     "- Khong ghi nguon, khong ghi URL, khong them loi dan\n"
     "- Tra ve truc tiep noi dung da viet lai"
+)
+
+SYSTEM_PROMPT_EN = (
+    "You are a professional news editor.\n"
+    "Task: Rewrite the given news in clear, engaging English.\n\n"
+    "Rules:\n"
+    "- Keep all key facts (numbers, names, dates)\n"
+    "- Write naturally, not like a translation\n"
+    "- Add relevant emojis at the start of paragraphs if suitable\n"
+    "- Length: concise, max 300 words\n"
+    "- End with up to 5 relevant hashtags\n"
+    "- Do not include source, URL, or any introduction\n"
+    "- Return only the rewritten content"
 )
 
 
@@ -137,21 +151,24 @@ def fetch_channel_messages(channel, last_id=0):
     return sorted(msgs, key=lambda x: x["id"])
 
 
-def rewrite_with_groq(text):
+def rewrite_with_groq(text, lang="vi"):
     if not text:
         return ""
+    prompt   = ("Viet lai tin tuc sau:\n\n" if lang == "vi"
+                else "Rewrite the following news:\n\n") + text
+    sys_prompt = SYSTEM_PROMPT_VI if lang == "vi" else SYSTEM_PROMPT_EN
     try:
         resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "Viet lai tin tuc sau:\n\n" + text},
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": prompt},
             ],
             temperature=0.7,
             max_tokens=600,
         )
         out = resp.choices[0].message.content.strip()
-        log.info("Groq OK (%d chars)", len(out))
+        log.info("Groq OK lang=%s (%d chars)", lang, len(out))
         return out
     except Exception as exc:
         log.error("Groq error: %s", exc)
@@ -170,49 +187,52 @@ def download_image(url):
     return None, None
 
 
-def post_message(caption, photo_url=None):
+def post_message(chat_id, caption, photo_url=None, img_cache=None):
     cap = caption[:1024] if len(caption) > 1024 else caption
 
     if photo_url:
-        img, ext = download_image(photo_url)
+        img = img_cache
+        ext = "jpg"
+        if img is None:
+            img, ext = download_image(photo_url)
         if img:
             fname = "photo." + (ext or "jpg")
             r = tg_post_multipart(
                 "sendPhoto",
-                {"chat_id": TELEGRAM_TARGET_CHAT,
+                {"chat_id": chat_id,
                  "caption": cap, "parse_mode": "Markdown"},
                 {"photo": (fname, img, "image/jpeg")},
             )
             if r:
-                log.info("Posted photo (upload) id=%s", r.get("message_id"))
-                return True
+                log.info("Posted photo (upload) to %s id=%s", chat_id, r.get("message_id"))
+                return True, img
         r = tg_post_json("sendPhoto", {
-            "chat_id": TELEGRAM_TARGET_CHAT,
+            "chat_id": chat_id,
             "photo": photo_url,
             "caption": cap,
             "parse_mode": "Markdown",
         })
         if r:
-            log.info("Posted photo (url) id=%s", r.get("message_id"))
-            return True
+            log.info("Posted photo (url) to %s id=%s", chat_id, r.get("message_id"))
+            return True, img
 
     if caption:
         txt = caption[:4096] if len(caption) > 4096 else caption
         r = tg_post_json("sendMessage", {
-            "chat_id": TELEGRAM_TARGET_CHAT,
+            "chat_id": chat_id,
             "text": txt,
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         })
         if r:
-            log.info("Posted text id=%s", r.get("message_id"))
-            return True
-    return False
+            log.info("Posted text to %s id=%s", chat_id, r.get("message_id"))
+            return True, None
+    return False, None
 
 
 def run_bot():
-    log.info("Bot starting | channels=%s | target=%s | model=%s",
-             SOURCE_CHANNELS, TELEGRAM_TARGET_CHAT, GROQ_MODEL)
+    log.info("Bot starting | sources=%s | vi=%s | en=%s | model=%s",
+             SOURCE_CHANNELS, TELEGRAM_TARGET_CHATS, TELEGRAM_TARGET_CHATS_EN, GROQ_MODEL)
     state = load_state()
     posted = 0
     for channel in SOURCE_CHANNELS:
@@ -229,11 +249,26 @@ def run_bot():
             text  = msg["text"]
             photo = msg.get("photo")
             log.info("Msg #%d photo=%s text=%.50s", mid, bool(photo), text)
-            caption = rewrite_with_groq(text) if text else ""
-            if not caption and not photo:
+
+            caption_vi = rewrite_with_groq(text, lang="vi") if text else ""
+            caption_en = rewrite_with_groq(text, lang="en") if text else ""
+
+            if not caption_vi and not caption_en and not photo:
                 log.warning("Skip #%d no content", mid)
                 continue
-            if post_message(caption, photo):
+
+            img_cache = None
+            ok_any = False
+            for chat in TELEGRAM_TARGET_CHATS:
+                ok, img_cache = post_message(chat, caption_vi, photo, img_cache)
+                ok_any = ok_any or ok
+                time.sleep(2)
+            for chat in TELEGRAM_TARGET_CHATS_EN:
+                ok, img_cache = post_message(chat, caption_en, photo, img_cache)
+                ok_any = ok_any or ok
+                time.sleep(2)
+
+            if ok_any:
                 state[channel] = max(state.get(channel, 0), mid)
                 posted += 1
                 save_state(state)
