@@ -91,34 +91,47 @@ def fetch_channel_messages(channel, last_id=0):
             return []
         html = resp.text
 
-        id_re = re.compile(
+        # Split HTML into per-message blocks keyed by message ID
+        # Each block starts at data-post="channel/ID" and ends before the next
+        block_re = re.compile(
             r'data-post="' + re.escape(name) + r'/([0-9]+)"',
         )
-        txt_re = re.compile(
-            r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-            re.DOTALL,
-        )
-        photo_re = re.compile(
-            r"background-image:url\('([^']+)'\)",
-        )
+        positions = [(m.group(1), m.start()) for m in block_re.finditer(html)]
 
-        ids    = id_re.findall(html)
-        texts  = txt_re.findall(html)
-        photos = photo_re.findall(html)
-
-        for i, mid_str in enumerate(ids):
+        for idx, (mid_str, pos) in enumerate(positions):
             mid = int(mid_str)
             if mid <= last_id:
                 continue
-            raw = texts[i] if i < len(texts) else ""
-            raw = re.sub(r"<br[ \t]*/?>", "\n", raw)
-            raw = re.sub(r"<[^>]+>", "", raw).strip()
-            photo = photos[i] if i < len(photos) else None
+            # Slice just this message block
+            end   = positions[idx + 1][1] if idx + 1 < len(positions) else len(html)
+            block = html[pos:end]
+
+            # --- Photo: only from tgme_widget_message_photo_wrap ---
+            # This div wraps real post photos, NOT emoji/stickers/icons
+            photo_re = re.compile(
+                r'tgme_widget_message_photo_wrap[^>]+style="[^"]*'
+                r'background-image:url\(\'(https://[^\']+)\'\)',
+            )
+            pm = photo_re.search(block)
+            photo = pm.group(1) if pm else None
+
+            # --- Text ---
+            txt_re = re.compile(
+                r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+                re.DOTALL,
+            )
+            tm  = txt_re.search(block)
+            raw = ""
+            if tm:
+                raw = re.sub(r"<br[ \t]*/?>", "\n", tm.group(1))
+                raw = re.sub(r"<[^>]+>", "", raw).strip()
+
             if raw or photo:
                 msgs.append({"id": mid, "text": raw,
                              "photo": photo, "channel": channel})
+                log.info("  #%d photo=%s text_len=%d", mid, bool(photo), len(raw))
 
-        log.info("Fetch %s: %d new", channel, len(msgs))
+        log.info("Fetch %s: %d new messages", channel, len(msgs))
     except Exception as exc:
         log.error("Fetch error %s: %s", channel, exc)
     return sorted(msgs, key=lambda x: x["id"])
@@ -183,16 +196,17 @@ def post_message(caption, photo_url=None):
             log.info("Posted photo (url) id=%s", r.get("message_id"))
             return True
 
-    txt = caption[:4096] if len(caption) > 4096 else caption
-    r = tg_post_json("sendMessage", {
-        "chat_id": TELEGRAM_TARGET_CHAT,
-        "text": txt,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    })
-    if r:
-        log.info("Posted text id=%s", r.get("message_id"))
-        return True
+    if caption:
+        txt = caption[:4096] if len(caption) > 4096 else caption
+        r = tg_post_json("sendMessage", {
+            "chat_id": TELEGRAM_TARGET_CHAT,
+            "text": txt,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        })
+        if r:
+            log.info("Posted text id=%s", r.get("message_id"))
+            return True
     return False
 
 
