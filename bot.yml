@@ -53,6 +53,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TARGET_CHAT: ${{ secrets.TELEGRAM_TARGET_CHAT }}
+          TELEGRAM_TARGET_CHAT_EN: ${{ secrets.TELEGRAM_TARGET_CHAT_EN }}
           SOURCE_CHANNELS:      ${{ secrets.SOURCE_CHANNELS }}
           GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL:           ${{ vars.GROQ_MODEL || 'llama-3.3-70b-versatile' }}
