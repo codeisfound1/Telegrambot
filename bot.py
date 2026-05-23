@@ -48,7 +48,7 @@ SYSTEM_PROMPT_EN = (
     "- Keep all key facts (numbers, names, dates)\n"
     "- Write naturally, not like a translation\n"
     "- Add relevant emojis at the start of paragraphs if suitable\n"
-    "- Length: concise, max 300 words\n"
+    "- Length: concise, max 100 words\n"
     "- End with up to 5 relevant hashtags\n"
     "- Do not include source, URL, or any introduction\n"
     "- Return only the rewritten content"
