@@ -34,7 +34,7 @@ SYSTEM_PROMPT_VI = (
     "Quy tac:\n"
     "- Giu nguyen thong tin quan trong (so lieu, ten, thoi gian)\n"
     "- Viet lai tu nhien, khong dich may\n"
-    "_ Luon viet co dau dung chinh ta tieng Viet
+    "_ Luon viet co dau dung chinh ta tieng Viet\n"
     "- Them emoji phu hop o dau moi doan neu can\n"
     "- Do dai: ngan gon, toi da 200 tu\n"
     "- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n"
