@@ -45,7 +45,7 @@ SYSTEM_PROMPT_VI = (
     "- Viet lai tu nhien, khong dich may\n"
     "_ Luon viet co dau dung chinh ta tieng Viet\n"
     "- Them emoji phu hop o dau moi doan neu can\n"
-    "- Do dai: ngan gon, toi da 200 tu\n"
+    "- Do dai: ngan gon, toi da 100 tu\n"
     "- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n"
     "- Khong ghi nguon, khong ghi URL, khong them loi dan\n"
     "- KHONG duoc suy nghi thanh tieng, khong giai thich, khong dan nhap\n"
