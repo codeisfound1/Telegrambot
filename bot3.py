@@ -28,17 +28,9 @@ GROQ_MODEL           = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
         "GROQ_FALLBACK_MODELS",
-        "qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant,moonshotai/kimi-k2-instruct",
+        "qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant",
     ).split(",") if m.strip()
 ]
-
-# Word caps. Photo captions get a tighter cap than text-only posts since
-# Telegram photo captions are capped at 1024 chars and should read as a
-# caption, not a full article.
-MAX_WORDS_VI_TEXT  = 200
-MAX_WORDS_VI_PHOTO = 200
-MAX_WORDS_EN_TEXT  = 100
-MAX_WORDS_EN_PHOTO = 100
 
 STATE_FILE   = Path("data/processed_ids.json")
 TELEGRAM_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN
@@ -53,10 +45,11 @@ SYSTEM_PROMPT_VI = (
     "- Viet lai tu nhien, khong dich may\n"
     "_ Luon viet co dau dung chinh ta tieng Viet\n"
     "- Them emoji phu hop o dau moi doan neu can\n"
-    "- Do dai: ngan gon, TOI DA 200 TU (bat buoc)\n"
+    "- Do dai: ngan gon, toi da 200 tu\n"
     "- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n"
     "- Khong ghi nguon, khong ghi URL, khong them loi dan\n"
-    "- Tra ve truc tiep noi dung da viet lai"
+    "- KHONG duoc suy nghi thanh tieng, khong giai thich, khong dan nhap\n"
+    "- Tra ve DUY NHAT noi dung da viet lai, khong them gi khac truoc/sau"
 )
 
 SYSTEM_PROMPT_EN = (
@@ -66,10 +59,11 @@ SYSTEM_PROMPT_EN = (
     "- Keep all key facts (numbers, names, dates)\n"
     "- Write naturally, not like a translation\n"
     "- Add relevant emojis at the start of paragraphs if suitable\n"
-    "- Length: concise, MAX 100 WORDS (hard limit)\n"
+    "- Length: concise, max 100 words\n"
     "- End with up to 5 relevant hashtags\n"
     "- Do not include source, URL, or any introduction\n"
-    "- Return only the rewritten content"
+    "- Do not show reasoning, thinking, or any preamble/explanation\n"
+    "- Return ONLY the rewritten content, nothing before or after it"
 )
 
 # Patterns stripped from raw source text when used as a fallback caption
@@ -97,26 +91,6 @@ def clean_source_text(text):
     t = _MULTI_BLANK_RE.sub("\n\n", t)
     t = "\n".join(line.rstrip() for line in t.split("\n"))
     return t.strip()
-
-
-def truncate_words(text, max_words):
-    """Word-boundary safe truncation. Keeps trailing hashtags where possible,
-    never cuts mid-word/mid-sentence like a blind char slice would."""
-    if not text:
-        return text
-    words = text.split()
-    if len(words) <= max_words:
-        return text
-    hashtags = [w for w in words if w.startswith("#")]
-    body_words = [w for w in words if not w.startswith("#")]
-    keep = max_words - len(hashtags)
-    if keep < 1:
-        keep = max_words
-        hashtags = []
-    truncated = " ".join(body_words[:keep]).rstrip(",.;:!?")
-    if hashtags:
-        truncated = truncated + " " + " ".join(hashtags)
-    return truncated.strip()
 
 
 def load_state():
@@ -215,10 +189,20 @@ def fetch_channel_messages(channel, last_id=0):
     return sorted(msgs, key=lambda x: x["id"])
 
 
+_PREAMBLE_RE = re.compile(
+    r'(?im)^\s*(here(\'|\u2019)s|day la|đây là|noi dung|nội dung|ban viet lai|'
+    r'bai viet lai|rewritten (version|text|content)|sure[,!]?)\b[^\n]*:?\s*\n+'
+)
+
+
 def _strip_thinking(text):
-    """Some Groq models (e.g. qwen/qwen3.6-27b in thinking mode) prepend
-    <think>...</think> reasoning blocks. Strip them from the final output."""
-    return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL).strip()
+    """Strip any residual <think>...</think> block (belt-and-suspenders on
+    top of reasoning_effort/reasoning_format) and drop a leading preamble
+    line if the model added one despite the system prompt."""
+    text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+    text = re.sub(r'```[a-zA-Z]*\n?|```', '', text)  # strip stray code fences
+    text = _PREAMBLE_RE.sub('', text, count=1)
+    return text.strip()
 
 
 def rewrite_with_groq(text, lang="vi"):
@@ -237,7 +221,7 @@ def rewrite_with_groq(text, lang="vi"):
     for model in models_to_try:
         for attempt in range(2):  # one retry per model on rate limit
             try:
-                resp = groq_client.chat.completions.create(
+                kwargs = dict(
                     model=model,
                     messages=[
                         {"role": "system", "content": sys_prompt},
@@ -245,7 +229,11 @@ def rewrite_with_groq(text, lang="vi"):
                     ],
                     temperature=0.7,
                     max_tokens=600,
+                    reasoning_format="hidden",  # suppress reasoning field on all reasoning models
                 )
+                if "qwen" in model:
+                    kwargs["reasoning_effort"] = "none"  # qwen3.6: true off-switch for thinking
+                resp = groq_client.chat.completions.create(**kwargs)
                 out = resp.choices[0].message.content.strip()
                 out = _strip_thinking(out)
                 if not out:
@@ -284,8 +272,6 @@ def download_image(url):
 
 
 def post_message(chat_id, caption, photo_url=None, img_cache=None):
-    # caption already word-capped in build_captions(); this is just a hard
-    # char-limit safety net for Telegram's photo-caption limit (1024 chars).
     cap = caption[:1024] if len(caption) > 1024 else caption
 
     if photo_url:
@@ -328,13 +314,11 @@ def post_message(chat_id, caption, photo_url=None, img_cache=None):
     return False, None
 
 
-def build_captions(text, has_photo=False):
-    """Returns (caption_vi, caption_en), each hard-capped to <=200/<=100
-    words respectively (word-boundary safe) regardless of what the model
-    returned. If Groq fully fails, falls back to the cleaned raw source
-    text (source channels are Vietnamese, so the cleaned raw text is used
-    for the VI post; EN post is skipped since no translation is available
-    without Groq)."""
+def build_captions(text):
+    """Returns (caption_vi, caption_en). If Groq fully fails, falls back to
+    the cleaned raw source text (source channels are Vietnamese, so the
+    cleaned raw text is used for the VI post; EN post is skipped since no
+    translation is available without Groq)."""
     if not text:
         return "", ""
 
@@ -347,11 +331,6 @@ def build_captions(text, has_photo=False):
     if caption_en is None:
         caption_en = ""  # no translation possible without Groq; skip EN post
         log.warning("Skipping EN caption (Groq unavailable, no translation)")
-
-    vi_cap = MAX_WORDS_VI_PHOTO if has_photo else MAX_WORDS_VI_TEXT
-    en_cap = MAX_WORDS_EN_PHOTO if has_photo else MAX_WORDS_EN_TEXT
-    caption_vi = truncate_words(caption_vi, vi_cap)
-    caption_en = truncate_words(caption_en, en_cap)
 
     return caption_vi, caption_en
 
@@ -377,7 +356,7 @@ def run_bot():
             photo = msg.get("photo")
             log.info("Msg #%d photo=%s text=%.50s", mid, bool(photo), text)
 
-            caption_vi, caption_en = build_captions(text, has_photo=bool(photo)) if text else ("", "")
+            caption_vi, caption_en = build_captions(text) if text else ("", "")
 
             if not caption_vi and not caption_en and not photo:
                 log.warning("Skip #%d no content", mid)
