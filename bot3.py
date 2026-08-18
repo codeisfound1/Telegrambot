@@ -28,7 +28,7 @@ GROQ_MODEL           = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_FALLBACK_MODELS = [
     m.strip() for m in os.environ.get(
         "GROQ_FALLBACK_MODELS",
-        "qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant",
+        "qwen/qwen3.6-27b,openai/gpt-oss-20b,llama-3.1-8b-instant,moonshotai/kimi-k2-instruct",
     ).split(",") if m.strip()
 ]
 
