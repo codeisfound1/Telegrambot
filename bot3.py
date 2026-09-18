@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import html
 import logging
 from pathlib import Path
 
@@ -178,7 +179,8 @@ def fetch_channel_messages(channel, last_id=0):
             raw = ""
             if tm:
                 raw = re.sub(r"<br[ \t]*/?>", "\n", tm.group(1))
-                raw = re.sub(r"<[^>]+>", "", raw).strip()
+                raw = re.sub(r"<[^>]+>", "", raw)
+                raw = html.unescape(raw).strip()
 
             if raw or photo:
                 msgs.append({"id": mid, "text": raw,
@@ -211,6 +213,17 @@ _VI_DIACRITIC_RE = re.compile(
     ]) + "]",
     re.IGNORECASE,
 )
+
+
+def _looks_vietnamese(text):
+    """Heuristic gate for lang="vi" output. A real Vietnamese rewrite has
+    diacritics on a large share of its syllables; an English response that
+    merely mentions a Vietnamese proper noun (e.g. "Viet Nam") only has a
+    couple, so check density rather than mere presence."""
+    if len(text) < 30:
+        return True  # too short to judge reliably
+    diacritics = len(_VI_DIACRITIC_RE.findall(text))
+    return diacritics / len(text) >= 0.03
 
 
 def _strip_thinking(text):
@@ -257,9 +270,9 @@ def rewrite_with_groq(text, lang="vi"):
                 if not out:
                     log.warning("Groq empty output model=%s lang=%s", model, lang)
                     break
-                if lang == "vi" and len(out) > 30 and not _VI_DIACRITIC_RE.search(out):
+                if lang == "vi" and not _looks_vietnamese(out):
                     log.warning(
-                        "Groq output has no Vietnamese diacritics (likely answered "
+                        "Groq output doesn't look like Vietnamese (likely answered "
                         "in English) model=%s lang=%s, trying next model", model, lang,
                     )
                     break
