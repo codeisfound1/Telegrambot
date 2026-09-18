@@ -57,6 +57,8 @@ jobs:
           SOURCE_CHANNELS:      ${{ secrets.SOURCE_CHANNELS }}
           GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL:           ${{ vars.GROQ_MODEL || 'llama-3.1-8b-instant' }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL:         ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
         run: |
           python bot3.py
 

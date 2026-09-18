@@ -10,6 +10,12 @@ from pathlib import Path
 import httpx
 from groq import Groq
 from groq import RateLimitError, APIStatusError, APIConnectionError
+from openai import OpenAI
+from openai import (
+    RateLimitError as OpenAIRateLimitError,
+    APIStatusError as OpenAIAPIStatusError,
+    APIConnectionError as OpenAIAPIConnectionError,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,10 +39,16 @@ GROQ_FALLBACK_MODELS = [
     ).split(",") if m.strip()
 ]
 
+# Optional: tried after every Groq model has failed. Leave OPENAI_API_KEY
+# unset to run Groq-only (openai_client stays None and this step is skipped).
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
 STATE_FILE   = Path("data/processed_ids.json")
 TELEGRAM_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+groq_client   = Groq(api_key=GROQ_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 SYSTEM_PROMPT_VI = (
     "Ban la mot bien tap vien tin tuc chuyen nghiep nguoi Viet.\n"
@@ -236,17 +248,29 @@ def _strip_thinking(text):
     return text.strip()
 
 
-def rewrite_with_groq(text, lang="vi"):
+def _accept_output(resp, provider, model, lang):
+    """Shared validation for a chat completion response: strips thinking
+    blocks/preamble, rejects empty output, and (for lang="vi") rejects
+    output that doesn't look like actual Vietnamese. Returns the cleaned
+    text, or None if the response should be rejected."""
+    out = resp.choices[0].message.content.strip()
+    out = _strip_thinking(out)
+    if not out:
+        log.warning("%s empty output model=%s lang=%s", provider, model, lang)
+        return None
+    if lang == "vi" and not _looks_vietnamese(out):
+        log.warning(
+            "%s output doesn't look like Vietnamese (likely answered in "
+            "English) model=%s lang=%s", provider, model, lang,
+        )
+        return None
+    log.info("%s OK model=%s lang=%s (%d chars)", provider, model, lang, len(out))
+    return out
+
+
+def _rewrite_with_groq_models(sys_prompt, prompt, lang):
     """Try GROQ_MODEL then each fallback model in order. Returns the
-    rewritten text, or None if every model failed (caller should fall back
-    to the raw source text instead of skipping the post)."""
-    if not text:
-        return ""
-
-    prompt = ("Viet lai tin tuc sau:\n\n" if lang == "vi"
-              else "Rewrite the following news:\n\n") + text
-    sys_prompt = SYSTEM_PROMPT_VI if lang == "vi" else SYSTEM_PROMPT_EN
-
+    rewritten text, or None if every model failed."""
     models_to_try = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
 
     for model in models_to_try:
@@ -265,18 +289,9 @@ def rewrite_with_groq(text, lang="vi"):
                 if "qwen" in model:
                     kwargs["reasoning_effort"] = "none"  # qwen3.6: true off-switch for thinking
                 resp = groq_client.chat.completions.create(**kwargs)
-                out = resp.choices[0].message.content.strip()
-                out = _strip_thinking(out)
-                if not out:
-                    log.warning("Groq empty output model=%s lang=%s", model, lang)
-                    break
-                if lang == "vi" and not _looks_vietnamese(out):
-                    log.warning(
-                        "Groq output doesn't look like Vietnamese (likely answered "
-                        "in English) model=%s lang=%s, trying next model", model, lang,
-                    )
-                    break
-                log.info("Groq OK model=%s lang=%s (%d chars)", model, lang, len(out))
+                out = _accept_output(resp, "Groq", model, lang)
+                if out is None:
+                    break  # move to next model
                 return out
             except RateLimitError as exc:
                 wait = 5 * (attempt + 1)
@@ -292,7 +307,64 @@ def rewrite_with_groq(text, lang="vi"):
                 break
         # move to next model in models_to_try
 
-    log.error("All Groq models failed for lang=%s, falling back to raw text", lang)
+    return None
+
+
+def _rewrite_with_openai(sys_prompt, prompt, lang):
+    """Last-resort fallback after every Groq model has failed. No-op
+    (returns None immediately) unless OPENAI_API_KEY is configured."""
+    if openai_client is None:
+        return None
+
+    for attempt in range(2):  # one retry on rate limit
+        try:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                max_tokens=600,
+            )
+            return _accept_output(resp, "OpenAI", OPENAI_MODEL, lang)
+        except OpenAIRateLimitError as exc:
+            wait = 5 * (attempt + 1)
+            log.warning("OpenAI rate limit model=%s attempt=%d: %s (retry in %ds)",
+                        OPENAI_MODEL, attempt, exc, wait)
+            time.sleep(wait)
+            continue
+        except (OpenAIAPIStatusError, OpenAIAPIConnectionError) as exc:
+            log.warning("OpenAI error model=%s: %s", OPENAI_MODEL, exc)
+            return None
+        except Exception as exc:
+            log.error("OpenAI unexpected error model=%s: %s", OPENAI_MODEL, exc)
+            return None
+
+    return None
+
+
+def rewrite_text(text, lang="vi"):
+    """Rewrite/translate text via Groq (GROQ_MODEL then fallbacks), then
+    OpenAI as a last resort if configured. Returns the rewritten text, or
+    None if every provider failed (caller should fall back to the raw
+    source text instead of skipping the post)."""
+    if not text:
+        return ""
+
+    prompt = ("Viet lai tin tuc sau:\n\n" if lang == "vi"
+              else "Rewrite the following news:\n\n") + text
+    sys_prompt = SYSTEM_PROMPT_VI if lang == "vi" else SYSTEM_PROMPT_EN
+
+    out = _rewrite_with_groq_models(sys_prompt, prompt, lang)
+    if out is not None:
+        return out
+
+    out = _rewrite_with_openai(sys_prompt, prompt, lang)
+    if out is not None:
+        return out
+
+    log.error("All providers failed for lang=%s, falling back to raw text", lang)
     return None
 
 
@@ -352,30 +424,30 @@ def post_message(chat_id, caption, photo_url=None, img_cache=None):
 
 
 def build_captions(text):
-    """Returns (caption_vi, caption_en). If Groq fully fails, falls back to
-    the cleaned raw source text (source channels are Vietnamese, so the
+    """Returns (caption_vi, caption_en). If every provider fails, falls back
+    to the cleaned raw source text (source channels are Vietnamese, so the
     cleaned raw text is used for the VI post; EN post is skipped since no
-    translation is available without Groq)."""
+    translation is available)."""
     if not text:
         return "", ""
 
-    caption_vi = rewrite_with_groq(text, lang="vi")
-    caption_en = rewrite_with_groq(text, lang="en")
+    caption_vi = rewrite_text(text, lang="vi")
+    caption_en = rewrite_text(text, lang="en")
 
     if caption_vi is None:
         caption_vi = clean_source_text(text)
-        log.warning("Using raw source text as VI caption (Groq unavailable)")
+        log.warning("Using raw source text as VI caption (all providers unavailable)")
     if caption_en is None:
-        caption_en = ""  # no translation possible without Groq; skip EN post
-        log.warning("Skipping EN caption (Groq unavailable, no translation)")
+        caption_en = ""  # no translation possible; skip EN post
+        log.warning("Skipping EN caption (all providers unavailable, no translation)")
 
     return caption_vi, caption_en
 
 
 def run_bot():
-    log.info("Bot starting | sources=%s | vi=%s | en=%s | model=%s | fallbacks=%s",
+    log.info("Bot starting | sources=%s | vi=%s | en=%s | model=%s | fallbacks=%s | openai_fallback=%s",
              SOURCE_CHANNELS, TELEGRAM_TARGET_CHATS, TELEGRAM_TARGET_CHATS_EN,
-             GROQ_MODEL, GROQ_FALLBACK_MODELS)
+             GROQ_MODEL, GROQ_FALLBACK_MODELS, OPENAI_MODEL if openai_client else "disabled")
     state = load_state()
     posted = 0
     for channel in SOURCE_CHANNELS:
