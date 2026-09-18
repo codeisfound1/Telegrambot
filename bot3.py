@@ -156,22 +156,22 @@ def fetch_channel_messages(channel, last_id=0):
         if resp.status_code != 200:
             log.warning("Cannot fetch %s: HTTP %s", channel, resp.status_code)
             return []
-        html = resp.text
+        page_html = resp.text
 
         # Split HTML into per-message blocks keyed by message ID
         # Each block starts at data-post="channel/ID" and ends before the next
         block_re = re.compile(
             r'data-post="' + re.escape(name) + r'/([0-9]+)"',
         )
-        positions = [(m.group(1), m.start()) for m in block_re.finditer(html)]
+        positions = [(m.group(1), m.start()) for m in block_re.finditer(page_html)]
 
         for idx, (mid_str, pos) in enumerate(positions):
             mid = int(mid_str)
             if mid <= last_id:
                 continue
             # Slice just this message block
-            end   = positions[idx + 1][1] if idx + 1 < len(positions) else len(html)
-            block = html[pos:end]
+            end   = positions[idx + 1][1] if idx + 1 < len(positions) else len(page_html)
+            block = page_html[pos:end]
 
             # --- Photo: only from tgme_widget_message_photo_wrap ---
             # This div wraps real post photos, NOT emoji/stickers/icons
