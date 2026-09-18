@@ -49,6 +49,8 @@ SYSTEM_PROMPT_VI = (
     "- Ket thuc bang hashtag lien quan (toi da 5 hashtag)\n"
     "- Khong ghi nguon, khong ghi URL, khong them loi dan\n"
     "- KHONG duoc suy nghi thanh tieng, khong giai thich, khong dan nhap\n"
+    "- BAT BUOC viet toan bo noi dung bang TIENG VIET co dau, "
+    "TUYET DOI KHONG duoc tra loi bang tieng Anh\n"
     "- Tra ve DUY NHAT noi dung da viet lai, khong them gi khac truoc/sau"
 )
 
@@ -194,6 +196,22 @@ _PREAMBLE_RE = re.compile(
     r'bai viet lai|rewritten (version|text|content)|sure[,!]?)\b[^\n]*:?\s*\n+'
 )
 
+# Vietnamese diacritic marks. Used to catch models (gpt-oss-20b in
+# particular) that ignore the Vietnamese system prompt and answer in
+# plain English instead - that output must not be accepted as the VI
+# caption, so the caller can fall through to the next model.
+_VI_DIACRITIC_RE = re.compile(
+    "[" + "".join([
+        "àáạảãâầấậẩẫ",
+        "ăằắặẳẵèéẹẻẽ",
+        "êềếệểễìíịỉĩ",
+        "òóọỏõôồốộổỗ",
+        "ơờớợởỡùúụủũ",
+        "ưừứựửữỳýỵỷỹđ",
+    ]) + "]",
+    re.IGNORECASE,
+)
+
 
 def _strip_thinking(text):
     """Strip any residual <think>...</think> block (belt-and-suspenders on
@@ -238,6 +256,12 @@ def rewrite_with_groq(text, lang="vi"):
                 out = _strip_thinking(out)
                 if not out:
                     log.warning("Groq empty output model=%s lang=%s", model, lang)
+                    break
+                if lang == "vi" and len(out) > 30 and not _VI_DIACRITIC_RE.search(out):
+                    log.warning(
+                        "Groq output has no Vietnamese diacritics (likely answered "
+                        "in English) model=%s lang=%s, trying next model", model, lang,
+                    )
                     break
                 log.info("Groq OK model=%s lang=%s (%d chars)", model, lang, len(out))
                 return out
